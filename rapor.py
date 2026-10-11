@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BİM SAMSUN — CEO STRATEJİK BRİFİNG v2
-AI'ı 3 parçaya böldük: daha güvenilir, daha derin.
+BİM SAMSUN — CEO STRATEJİK BRİFİNG v3
+- AI hataları mailde görünür
+- Samsun için yerel kaynaklar
+- AI çökerse şablon brifing
+- Çeviri hatası da görünür
 """
 
-import os, re, time, json, smtplib, calendar
+import os, re, time, json, smtplib, calendar, traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -16,22 +19,32 @@ from urllib.parse import quote
 import feedparser, requests, pandas as pd
 from groq import Groq
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 MAIL_USER = os.environ.get("MAIL_USER")
 MAIL_PASS = os.environ.get("MAIL_PASS")
 MAIL_TO = os.environ.get("MAIL_TO")
-GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# Model fallback zinciri — biri çalışmazsa diğeri denenir
+GROQ_MODELLERI = ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant"]
+
+# Global hata kaydı — mailde gösterilecek
+HATALAR = []
+
+def hata_yaz(msg):
+    print(f"❌ {msg}")
+    HATALAR.append(msg)
 
 # ============================================================
-# HABER KAYNAKLARI
+# SAMSUN HABERLERİ — Yerel kaynaklara öncelik
 # ============================================================
 def gnews(q):
     return f"https://news.google.com/rss/search?q={quote(q)}&hl=tr&gl=TR&ceid=TR:tr"
 
 KAYNAKLAR = {
     "🏪 Samsun & Bölge": [
-        ("Samsun AVM-Perakende", gnews('"Samsun" (AVM OR market OR perakende OR mağaza)'), False),
-        ("Samsun Ticaret", gnews('"Samsun" (ticaret OR sanayi OR ihracat OR TSO OR istihdam)'), False),
+        # Google News'te yerel kaynak domainleri ile sınırla
+        ("Samsun (AVM/Market)", gnews('Samsun AVM OR market OR mağaza site:haberler.com OR site:samsunhaber.com OR site:hed ef.com.tr OR site:aksiyon.com.tr'), False),
+        ("Samsun Ticaret/Sanayi", gnews('Samsun TSO OR "ticaret odası" OR "sanayi odası" OR ihracat OR istihdam -spor -maç -transfer'), False),
     ],
     "🇹🇷 Türkiye Ekonomi": [
         ("AA Ekonomi", "https://www.aa.com.tr/tr/rss/default?cat=ekonomi", False),
@@ -44,9 +57,6 @@ KAYNAKLAR = {
     "🌍 Dünya Ekonomi": [
         ("BBC Business", "http://feeds.bbci.co.uk/news/business/rss.xml", True),
     ],
-    "🌐 Dünya Gündem": [
-        ("BBC World", "http://feeds.bbci.co.uk/news/world/rss.xml", True),
-    ],
     "🛒 Perakende": [
         ("Retail Dive", "https://www.retaildive.com/feeds/news/", True),
         ("Perakende Sektörü", "https://perakendesektoru.com/feed/", False),
@@ -56,34 +66,20 @@ KAYNAKLAR = {
     ],
 }
 
-# Alakasız haberleri at (spor, magazin, şiddet)
+# Yasaklı — sport/magazin/şiddet
 YASAKLI = [
-    "şampiyon", "maç", "tenis", "futbol", "basketbol", "voleybol", "kupa",
-    "gol ", "lig", "turnuva", "atletizm", "boks", "güreş", "olimpiyat",
-    "magazin", "ünlü", "dizi", "film", "konser", "oyuncu",
-    "öldü", "cinayet", "kaza sonucu", "yangın çıktı", "saldırı düzenlendi",
-    "şehit", "terör", "patlama oldu",
+    "spor", "sport", "maç", "futbol", "basketbol", "voleybol", "tenis",
+    "şampiyon", "gol", "lig", "turnuva", "transfermarkt", "samsunspor",
+    "transfer", "teknik direktör", "puan", "kupası", "atletizm", "boks",
+    "güreş", "olimpiyat", "stadyum", "taraftar", "derbi",
+    "magazin", "ünlü", "dizi", "konser", "oyuncu", "sanatçı",
+    "öldü", "cinayet", "yangın", "terör", "şehit", "patlama",
 ]
 
-# Sadece bu kelimeler varsa ekonomi kategorisinde kabul et
-EKONOMI_ANAHTAR = [
-    "enflasyon", "faiz", "tüik", "tcmb", "merkez bankası", "büyüme",
-    "gsyh", "ihracat", "ithalat", "bütçe", "vergi", "döviz", "kur ",
-    "tüfe", "üfe", "perakende", "satış", "tüketici", "istihdam",
-    "işsizlik", "asgari ücret", "kredi", "banka", "borsa", "piyasa",
-    "üretim", "sanayi", "ticaret", "yatırım", "ekonomi",
-]
-
-def _yasakli_mi(baslik):
+def yasakli_mi(baslik):
     b = baslik.lower()
     return any(k in b for k in YASAKLI)
 
-def _ekonomi_mi(baslik):
-    b = baslik.lower()
-    return any(k in b for k in EKONOMI_ANAHTAR)
-
-# ============================================================
-# VERİ TOPLAMA
 # ============================================================
 def temizle(m):
     m = re.sub(r"<[^>]+>", " ", m or "")
@@ -96,47 +92,40 @@ def haber_topla():
         for ad, url, ing in kaynaklar:
             try:
                 feed = feedparser.parse(url, agent="Mozilla/5.0")
-                for e in feed.entries[:8]:
+                for e in feed.entries[:10]:
                     tarih = e.get("published_parsed") or e.get("updated_parsed")
                     if not tarih:
                         continue
                     baslik = temizle(e.get("title", ""))
-                    if not baslik or _yasakli_mi(baslik):
-                        continue
-                    # Ekonomi kategorisinde anahtar kelime zorunlu
-                    if "Ekonomi" in kategori and not _ekonomi_mi(baslik):
+                    if not baslik or yasakli_mi(baslik):
                         continue
                     kayitlar.append({
-                        "Kategori": kategori,
-                        "Kaynak": ad,
-                        "Başlık": baslik,
+                        "Kategori": kategori, "Kaynak": ad, "Başlık": baslik,
                         "Özet": temizle(e.get("summary", ""))[:400],
-                        "Link": e.get("link", ""),
-                        "İngilizce": ing,
+                        "Link": e.get("link", ""), "İngilizce": ing,
                         "Tarih": datetime.fromtimestamp(calendar.timegm(tarih), tz=timezone.utc),
                     })
             except Exception as ex:
-                print(f"RSS hata ({ad}): {ex}")
-        # Tekrarlıları temizle + en yeni 5
+                hata_yaz(f"RSS hatası [{ad}]: {ex}")
+        # Tekrarlıları temizle
         gorulen = set()
         benzersiz = []
         for h in sorted(kayitlar, key=lambda x: x["Tarih"], reverse=True):
-            anahtar = re.sub(r"\W+", "", h["Başlık"].lower())[:60]
+            anahtar = re.sub(r"\W+", "", h["Başlık"].lower())[:50]
             if anahtar not in gorulen:
                 gorulen.add(anahtar)
                 benzersiz.append(h)
         sonuc[kategori] = benzersiz[:5]
+        print(f"  {kategori}: {len(benzersiz)} haber")
     return sonuc
 
 # ============================================================
-# SEC + DÜNYA BANKASI
+# SEC + MAKRO
 # ============================================================
-SEC_HEADERS = {"User-Agent": "BIM-Samsun/1.0"}
-
 def sec_verisi(cik, ad):
     try:
         url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik.zfill(10)}.json"
-        r = requests.get(url, headers=SEC_HEADERS, timeout=25)
+        r = requests.get(url, headers={"User-Agent": "BIM-Samsun/1.0"}, timeout=25)
         if r.status_code != 200:
             return {"Şirket": ad, "Gelir (mr $)": "-", "Net Kâr (mr $)": "-", "Dönem": "-"}
         f = r.json().get("facts", {}).get("us-gaap", {})
@@ -182,31 +171,26 @@ def makro():
     return pd.DataFrame(r)
 
 # ============================================================
-# ÇEVİRİ
+# ÇEVİRİ — Hata görünür
 # ============================================================
-def turkce_mi(m):
-    if not m or len(m) < 15: return False
-    if any(c in m.lower() for c in "çğıöşü"): return True
-    tr = ["ve","ile","için","bir","bu","da","de","yeni","yıl","satış","pazar","şirket","artış"]
-    return sum(1 for k in tr if f" {k} " in f" {m.lower()} ") >= 2
-
 def cevir(haber_dict, client):
     tum = [h for v in haber_dict.values() for h in v]
     cevrilecek = [h for h in tum if h.get("İngilizce")]
-    if not cevrilecek or not client:
+    if not cevrilecek:
+        return haber_dict
+    if not client:
+        hata_yaz("Çeviri atlandı: Groq client yok")
         return haber_dict
     for i in range(0, len(cevrilecek), 3):
         grup = cevrilecek[i:i+3]
-        metin = "\n\n".join([f"[{j}]\nBAŞLIK: {h['Başlık']}\nÖZET: {h['Özet'][:250]}" for j, h in enumerate(grup)])
-        p = f"""İngilizce perakende/ekonomi haberlerini profesyonel Türkçeye çevir. Şirket isimlerini bırak. JSON:
-{{"ceviriler":[{{"id":0,"baslik":"...","ozet":"..."}}]}}
-
-{metin}"""
-        for deneme in range(2):
+        metin = "\n\n".join([f"[{j}]\nBAŞLIK: {h['Başlık']}\nÖZET: {h['Özet'][:200]}" for j, h in enumerate(grup)])
+        p = f'JSON formatında cevap ver. İngilizce haberleri Türkçeye çevir: {{"ceviriler":[{{"id":0,"baslik":"...","ozet":"..."}}]}}\n\n{metin}'
+        basarili = False
+        for model in GROQ_MODELLERI:
             try:
                 y = client.chat.completions.create(
                     messages=[{"role":"user","content":p}],
-                    model=GROQ_MODEL, response_format={"type":"json_object"},
+                    model=model, response_format={"type":"json_object"},
                     max_tokens=1500, temperature=0.1)
                 s = json.loads(y.choices[0].message.content)
                 for c in s.get("ceviriler", []):
@@ -215,37 +199,57 @@ def cevir(haber_dict, client):
                         grup[j]["Başlık"] = c.get("baslik", grup[j]["Başlık"])
                         grup[j]["Özet"] = c.get("ozet", grup[j]["Özet"])
                         grup[j]["İngilizce"] = False
+                basarili = True
                 break
             except Exception as e:
-                print(f"Çeviri deneme {deneme+1}: {e}")
-                time.sleep(2)
+                print(f"Çeviri {model} hata: {e}")
+                continue
+        if not basarili:
+            hata_yaz(f"Çeviri başarısız: {len(grup)} haber")
     return haber_dict
 
 # ============================================================
-# AI — 3 PARÇALI (RETRY'Lİ)
+# AI — HATA GÖRÜNÜR + MODEL FALLBACK
 # ============================================================
-def _ai(client, sistem, kullanici, max_tok=2500):
-    """Tek AI çağrısı. 3 denemeli."""
-    for deneme in range(3):
-        try:
-            y = client.chat.completions.create(
-                messages=[{"role":"system","content":sistem},{"role":"user","content":kullanici}],
-                model=GROQ_MODEL, response_format={"type":"json_object"},
-                max_tokens=max_tok, temperature=0.15)
-            return json.loads(y.choices[0].message.content)
-        except Exception as e:
-            print(f"AI deneme {deneme+1} hata: {e}")
-            time.sleep(3 * (deneme + 1))
+def ai_cagir(client, sistem, kullanici, max_tok=2500):
+    """Model fallback zinciri + 2 deneme/model."""
+    if not client:
+        hata_yaz("AI client yok")
+        return None
+    son_hata = "bilinmiyor"
+    for model in GROQ_MODELLERI:
+        for deneme in range(2):
+            try:
+                y = client.chat.completions.create(
+                    messages=[
+                        {"role":"system","content":sistem},
+                        {"role":"user","content":kullanici}
+                    ],
+                    model=model,
+                    response_format={"type":"json_object"},
+                    max_tokens=max_tok,
+                    temperature=0.15)
+                icerik = y.choices[0].message.content
+                return json.loads(icerik)
+            except json.JSONDecodeError as e:
+                son_hata = f"JSON parse: {str(e)[:100]}"
+                print(f"  {model} JSON hatası: {e}")
+                continue
+            except Exception as e:
+                son_hata = f"{type(e).__name__}: {str(e)[:150]}"
+                print(f"  {model} hata: {son_hata}")
+                time.sleep(2)
+    hata_yaz(f"AI tüm modellerde başarısız. Son: {son_hata}")
     return None
 
 def ai_core(client, abd_df, tr_df, makro_df, haber_m, tema, terim):
     sistem = """Sen BİM Samsun Bölge Müdürü'nün strateji danışmanısın.
 Çıktı TAMAMEN TÜRKÇE olmalı. Şirket isimleri hariç İngilizce kelime kullanma.
-Sadece verilen verilere dayan. Yorumları "olabilir/muhtemel" diliyle yaz.
 
-JSON: {"manset":"tek cümle","sabah_60_saniye":[{"sinyal":"","rakam":"","neden_onemli":"","etki":""}],"haftalik_pusula":"1 paragraf","uyari_seviyesi":"YEŞİL|SARI|KIRMIZI — gerekçesi"}"""
-    k = f"""Tarih: {datetime.now().strftime('%d.%m.%Y %A')} | Bölge: SAMSUN
-Tema: {tema[0]} | Terim: {terim[0]}
+JSON formatında cevap ver:
+{"manset":"tek cümle","sabah_60_saniye":[{"sinyal":"","rakam":"","neden_onemli":"","etki":""}],"haftalik_pusula":"1 paragraf","uyari_seviyesi":"YEŞİL veya SARI veya KIRMIZI — gerekçesi"}"""
+    k = f"""Tarih: {datetime.now().strftime('%d.%m.%Y')} | Bölge: SAMSUN
+Tema: {tema[0]}
 
 ABD: {abd_df.to_string(index=False)}
 TR: {tr_df.to_string(index=False)}
@@ -254,37 +258,37 @@ Makro: {makro_df.to_string(index=False) if not makro_df.empty else 'Yok'}
 HABERLER:
 {haber_m}
 
-3 sinyal (en kritik) + manşet + haftalık pusula + uyarı seviyesi üret."""
-    return _ai(client, sistem, k, 2000) or {"manset":"Analiz üretilemedi.","sabah_60_saniye":[],"haftalik_pusula":"","uyari_seviyesi":"SARI"}
+3 sinyal + manşet + haftalık pusula + uyarı seviyesi. JSON döndür."""
+    r = ai_cagir(client, sistem, k, 2000)
+    return r or {"manset":"AI çöktü — bkz. hata raporu","sabah_60_saniye":[],"haftalik_pusula":"","uyari_seviyesi":"SARI — AI hatası"}
 
 def ai_strateji(client, tr_df, haber_m, terim):
     sistem = """BİM Samsun strateji danışmanı. Türkçe, karar odaklı.
-JSON: {"karar_gundemi":[{"konu":"","seçenek_a":"","seçenek_b":"","öneri":"","gerekçe":""}],"rakip_radari":[{"rakip":"","hamle":"","bim_icin_ders":""}],"makro_pusu":[{"gösterge":"","veri":"","yorum":"","aksiyon":""}]}"""
+JSON döndür: {"karar_gundemi":[{"konu":"","seçenek_a":"","seçenek_b":"","öneri":"","gerekçe":""}],"rakip_radari":[{"rakip":"","hamle":"","bim_icin_ders":""}],"makro_pusu":[{"gösterge":"","veri":"","yorum":"","aksiyon":""}]}"""
     k = f"""TR Rakipler: {tr_df.to_string(index=False)}
 
 HABERLER:
 {haber_m}
 
-2-3 karar + 2-3 rakip + 2-3 makro maddesi üret."""
-    return _ai(client, sistem, k, 2500) or {"karar_gundemi":[],"rakip_radari":[],"makro_pusu":[]}
+2-3 karar + 2-3 rakip + 2-3 makro. JSON döndür."""
+    r = ai_cagir(client, sistem, k, 2500)
+    return r or {"karar_gundemi":[],"rakip_radari":[],"makro_pusu":[]}
 
 def ai_yerel(client, samsun_haber, terim):
-    sistem = """BİM Samsun strateji danışmanı. Türkçe, karar odaklı.
-Samsun haberleri BİM operasyonuna nasıl yansır? Somut öneri ver.
-JSON: {"samsun_odak":{"gelisme":"","bim_etkisi":"","aksiyon":""},"senaryolar":[{"tetikleyici":"","iyimser":"","baz":"","kotumser":"","hazırlık":""}],"saha_nabzi":{"gozlem":"","soru":"","beklenti":""}}"""
+    sistem = """BİM Samsun strateji danışmanı. Türkçe.
+Samsun haberleri BİM operasyonuna nasıl yansır? Somut öneri.
+JSON döndür: {"samsun_odak":{"gelisme":"","bim_etkisi":"","aksiyon":""},"senaryolar":[{"tetikleyici":"","iyimser":"","baz":"","kotumser":"","hazırlık":""}],"saha_nabzi":{"gozlem":"","soru":"","beklenti":""}}"""
     k = f"""Bölge: SAMSUN
-Günün terimi: {terim[0]} — {terim[1]}
+Terim: {terim[0]}
 
 SAMSUN HABERLERİ:
-{samsun_haber}
+{samsun_haber if samsun_haber else 'Bugün Samsun haberi yok'}
 
-Samsun odağı + 1-2 senaryo + saha nabzı üret."""
-    return _ai(client, sistem, k, 2000) or {"samsun_odak":{"gelisme":"","bim_etkisi":"","aksiyon":""},"senaryolar":[],"saha_nabzi":{"gozlem":"","soru":"","beklenti":""}}
+Samsun odağı + 1-2 senaryo + saha nabzı. JSON döndür."""
+    r = ai_cagir(client, sistem, k, 2000)
+    return r or {"samsun_odak":{"gelisme":"","bim_etkisi":"","aksiyon":""},"senaryolar":[],"saha_nabzi":{"gozlem":"","soru":"","beklenti":""}}
 
 def ceo_brifing(abd_df, tr_df, makro_df, haberler, terim, tema, client):
-    if not client:
-        return _bos()
-    # Haberleri düzleştir
     tum = []
     for k, v in haberler.items():
         for h in v[:3]:
@@ -292,46 +296,39 @@ def ceo_brifing(abd_df, tr_df, makro_df, haberler, terim, tema, client):
     haber_m = "\n".join(tum[:25])
     samsun_haber = "\n".join([f"- {h['Başlık']}: {h['Özet'][:150]}" for h in haberler.get("🏪 Samsun & Bölge", [])[:5]])
 
-    print("  → AI Core çağrısı...")
+    print("  → AI Core...")
     core = ai_core(client, abd_df, tr_df, makro_df, haber_m, tema, terim)
-    print("  → AI Strateji çağrısı...")
+    print("  → AI Strateji...")
     strat = ai_strateji(client, tr_df, haber_m, terim)
-    print("  → AI Yerel çağrısı...")
+    print("  → AI Yerel...")
     yerel = ai_yerel(client, samsun_haber, terim)
 
     return {**core, **strat, **yerel}
 
-def _bos():
-    return {"manset":"Brifing üretilemedi.","sabah_60_saniye":[],
-            "samsun_odak":{"gelisme":"","bim_etkisi":"","aksiyon":""},
-            "karar_gundemi":[],"rakip_radari":[],"makro_pusu":[],"senaryolar":[],
-            "saha_nabzi":{"gozlem":"","soru":"","beklenti":""},
-            "haftalik_pusula":"","uyari_seviyesi":"SARI — analiz üretilemedi"}
-
 # ============================================================
-# SÖZLÜK + TEMA
+# SÖZLÜK
 # ============================================================
 SOZLUK = [
     ("LFL (Like-for-Like)", "Aynı mağaza büyümesi. BİM H1 2026: +%37,3 — fiyat kaynaklı.", "BİM'de LFL'in çoğu fiyat artışından. Gerçek hacim büyümesi yoksa sürdürülemez."),
-    ("Brüt Kâr Marjı", "Satıştan malın maliyeti düşüldükten sonra kalan oran. BİM: %19,1.", "Özel marka payını 5 puan artırmak brüt marjı ~1 puan yükseltir."),
-    ("FAVÖK (EBITDA)", "Faiz/Vergi/Amortisman öncesi kâr. Nakit üretimi. BİM: %5,4.", "Türkiye perakendesinde %5+ dünya ortalaması üstü."),
-    ("Özel Marka", "Marketin kendi markası. BİM: %55, ALDI: %90.", "ALDI modelinde %90 mümkün. BİM için 5 yıllık hedef %65 olmalı."),
+    ("Brüt Kâr Marjı", "Malın maliyeti düşüldükten sonra kalan oran. BİM: %19,1.", "Özel marka payını 5 puan artırmak brüt marjı ~1 puan yükseltir."),
+    ("FAVÖK (EBITDA)", "Faiz/Vergi/Amortisman öncesi kâr. BİM: %5,4.", "Türkiye perakendesinde %5+ dünya ortalaması üstü."),
+    ("Özel Marka", "Marketin kendi markası. BİM: %55, ALDI: %90.", "ALDI modelinde %90 mümkün. BİM için hedef %65 olmalı."),
     ("Stok Devir Hızı", "Stok yılda kaç kez yenileniyor. A101: 14, ALDI: 12.", "Her 1 puan artış nakit akışına 1-2 mr TL katkı."),
     ("Fire Oranı", "Bozulma/kayıp oranı. Costco: %0,4, sektör: %1,5.", "BİM'in taze ürün genişlemesi fire riski getirir."),
     ("TMS 29", "Enflasyon muhasebesi. Türkiye'de zorunlu.", "Nakit kâr ≠ Muhasebe kârı."),
-    ("CAPEX", "Uzun vadeli yatırım. BİM: ~%2,5.", "BİM son 5 yılda yavaşladı. Yeni format için CAPEX artışı gerekebilir."),
-    ("Retail Media", "Raf/uygulama reklam geliri. Walmart: +%38.", "BİM'in bu alanda sıfır geliri var. 20 pilot mağaza = yıllık 500 mn TL."),
-    ("Ajan Tabanlı Ticaret", "AI'ların müşteri adına alışverişi. 2030: 3-5 tr $.", "BİM uygulaması AI ajanı kabul etmezse genç müşteri kaybeder."),
+    ("CAPEX", "Uzun vadeli yatırım. BİM: ~%2,5.", "BİM son 5 yılda yavaşladı."),
+    ("Retail Media", "Raf/uygulama reklam geliri. Walmart: +%38.", "BİM'in bu alanda sıfır geliri var."),
+    ("Ajan Tabanlı Ticaret", "AI'ların müşteri adına alışverişi.", "BİM uygulaması AI ajanı kabul etmeli."),
     ("ROCE", "Sermaye getirisi. Tesco: %15,2.", "BİM'in ROCE'si muhtemelen %25+."),
-    ("NPS", "Net Tavsiye Skoru. Tesco: 33.", "BİM NPS'i ölçmüyor. Yıllık müşteri anketi şart."),
-    ("Omnichannel", "Mağaza + online birlikte. Migros: 2.520 online mağaza.", "BİM online'a girmedi. Strateji mi, eksiklik mi?"),
-    ("Hard Discount", "Az çeşit, düşük fiyat. BİM, A101, ŞOK.", "Türkiye'de pay %60+. Premium segment boş."),
-    ("SKU Yönetimi", "Ürün çeşidi. BİM: ~1.000, Migros: ~10.000.", "BİM'in 1.000 SKU disiplini kârlılığın sırrı."),
-    ("TEPE", "TEPAV Perakende Güven Endeksi.", "TEPE pozitife dönerse tüketici harcaması artar."),
-    ("Müşteri Trafiği", "Mağazaya giren müşteri. BİM: +%0,4.", "Trafik artmıyor, sepet büyüyor. Fiyat kaynaklı büyüme."),
-    ("Ortalama Sepet", "Satış / işlem sayısı.", "BİM'de sepet büyüyor ama içi küçülüyor."),
-    ("Raf Bulunurluğu", "İstenen ürünün rafta olma oranı. İdeal: %97-99.", "Taze üründe bu oran düşebilir. Gizli müşteri şart."),
-    ("Stoksuz Kalma", "Talep varken rafın boş olması. İdeal: <%3.", "Her %1 stoksuz kalma = %0,5 ciro kaybı."),
+    ("NPS", "Net Tavsiye Skoru. Tesco: 33.", "BİM NPS'i ölçmüyor."),
+    ("Omnichannel", "Mağaza + online. Migros: 2.520 online.", "BİM online'a girmedi."),
+    ("Hard Discount", "Az çeşit, düşük fiyat. BİM, A101, ŞOK.", "Türkiye'de pay %60+."),
+    ("SKU Yönetimi", "Ürün çeşidi. BİM: ~1.000, Migros: ~10.000.", "1.000 SKU disiplini kârlılığın sırrı."),
+    ("TEPE", "TEPAV Perakende Güven Endeksi.", "Pozitife dönerse harcama artar."),
+    ("Müşteri Trafiği", "Mağazaya giren müşteri. BİM: +%0,4.", "Trafik artmıyor, sepet büyüyor."),
+    ("Ortalama Sepet", "Satış / işlem sayısı.", "BİM'de sepet içi küçülüyor."),
+    ("Raf Bulunurluğu", "Ürünün rafta olma oranı. İdeal: %97-99.", "Taze üründe düşebilir."),
+    ("Stoksuz Kalma", "Talep varken rafın boş olması. İdeal: <%3.", "Her %1 kayıp = %0,5 ciro."),
 ]
 
 HAFTANIN_TEMASI = {
@@ -344,17 +341,14 @@ HAFTANIN_TEMASI = {
 def gunun_terimi():
     return SOZLUK[datetime.now().timetuple().tm_yday % len(SOZLUK)]
 
-# ============================================================
-# DÜNYA ATLASI
-# ============================================================
 DUNYA_ATLASI = [
     {"Şirket":"Walmart","Ülke":"🇺🇸 ABD","Nüfus":"335 mn","GSYH":"$27,4 tr","Dil":"İngilizce","Geçim":"Hizmet, teknoloji, üretim","Mağaza":"10.500+","Strateji":"Ölçek + lojistik + retail media"},
     {"Şirket":"Amazon","Ülke":"🇺🇸 ABD","Nüfus":"335 mn","GSYH":"$27,4 tr","Dil":"İngilizce","Geçim":"E-ticaret, bulut","Mağaza":"Dijital","Strateji":"Otomasyon + AI + lojistik"},
-    {"Şirket":"Costco","Ülke":"🇺🇸 ABD","Nüfus":"335 mn","GSYH":"$27,4 tr","Dil":"İngilizce","Geçim":"Üyelik modeli","Mağaza":"870+","Strateji":"Üyelik sadakati + düşük marj"},
-    {"Şirket":"Aldi","Ülke":"🇩🇪 Almanya","Nüfus":"84 mn","GSYH":"$4,6 tr","Dil":"Almanca","Geçim":"Üretim, ihracat","Mağaza":"7.000+","Strateji":"%90 özel marka, maliyet"},
+    {"Şirket":"Costco","Ülke":"🇺🇸 ABD","Nüfus":"335 mn","GSYH":"$27,4 tr","Dil":"İngilizce","Geçim":"Üyelik modeli","Mağaza":"870+","Strateji":"Üyelik sadakati"},
+    {"Şirket":"Aldi","Ülke":"🇩🇪 Almanya","Nüfus":"84 mn","GSYH":"$4,6 tr","Dil":"Almanca","Geçim":"Üretim, ihracat","Mağaza":"7.000+","Strateji":"%90 özel marka"},
     {"Şirket":"Lidl","Ülke":"🇩🇪 Almanya","Nüfus":"84 mn","GSYH":"$4,6 tr","Dil":"Almanca","Geçim":"Üretim, ihracat","Mağaza":"12.000+","Strateji":"Mağaza verimliliği"},
-    {"Şirket":"Carrefour","Ülke":"🇫🇷 Fransa","Nüfus":"68 mn","GSYH":"$3,1 tr","Dil":"Fransızca","Geçim":"Hizmet, turizm, tarım","Mağaza":"14.000+","Strateji":"Omnichannel + dijital"},
-    {"Şirket":"Tesco","Ülke":"🇬🇧 İngiltere","Nüfus":"68 mn","GSYH":"$3,3 tr","Dil":"İngilizce","Geçim":"Finans, hizmet","Mağaza":"4.000+","Strateji":"Veri analitiği + sadakat"},
+    {"Şirket":"Carrefour","Ülke":"🇫🇷 Fransa","Nüfus":"68 mn","GSYH":"$3,1 tr","Dil":"Fransızca","Geçim":"Hizmet, turizm","Mağaza":"14.000+","Strateji":"Omnichannel"},
+    {"Şirket":"Tesco","Ülke":"🇬🇧 İngiltere","Nüfus":"68 mn","GSYH":"$3,3 tr","Dil":"İngilizce","Geçim":"Finans, hizmet","Mağaza":"4.000+","Strateji":"Veri analitiği"},
 ]
 
 # ============================================================
@@ -363,7 +357,7 @@ DUNYA_ATLASI = [
 def df_table(df, baslik):
     if df.empty: return f"<p><em>{baslik}: veri yok.</em></p>"
     h = f'<h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:22px">{baslik}</h3>'
-    h += '<table style="border-collapse:collapse;width:100%;font-size:12px;font-family:Segoe UI,Arial"><thead><tr style="background:#1e293b;color:white">'
+    h += '<table style="border-collapse:collapse;width:100%;font-size:12px"><thead><tr style="background:#1e293b;color:white">'
     for c in df.columns: h += f'<th style="padding:8px;text-align:left;border:1px solid #334155">{c}</th>'
     h += '</tr></thead><tbody>'
     for i, row in df.iterrows():
@@ -383,21 +377,30 @@ def html_uret(br, abd_df, tr_df, makro_df, haberler, terim, tema):
     tarih = datetime.now().strftime("%d.%m.%Y %A")
     renk, bg = uyari_renk(br.get("uyari_seviyesi",""))
 
+    # HATA RAPORU — varsa en üstte göster
+    hata_html = ""
+    if HATALAR:
+        hata_html = f'''<div style="background:#fee2e2;border:2px solid #dc2626;padding:14px;border-radius:8px;margin-top:14px">
+            <div style="font-weight:700;color:#991b1b;margin-bottom:8px">⚠️ Sistem Uyarıları ({len(HATALAR)})</div>
+            <ul style="margin:0;padding-left:20px;color:#7f1d1d;font-size:12px;line-height:1.6">
+            {"".join(f"<li>{h}</li>" for h in HATALAR)}
+            </ul></div>'''
+
     sinyaller = "".join([f'''<div style="padding:14px;margin:10px 0;background:white;border-left:5px solid #3b82f6;border-radius:6px">
-        <div style="display:flex;justify-content:space-between;align-items:start;gap:10px">
+        <div style="display:flex;justify-content:space-between;gap:10px">
             <div style="font-weight:700;color:#0f172a;font-size:15px">{s.get("sinyal","")}</div>
             <div style="background:#eff6ff;color:#1e40af;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;white-space:nowrap">{s.get("rakam","")}</div>
         </div>
-        <div style="color:#475569;margin-top:8px;font-size:13px;line-height:1.6">{s.get("neden_onemli","")}</div>
+        <div style="color:#475569;margin-top:8px;font-size:13px">{s.get("neden_onemli","")}</div>
         <div style="color:#7c2d12;font-style:italic;font-size:13px;margin-top:6px;padding-top:6px;border-top:1px dashed #e2e8f0">→ {s.get("etki","")}</div>
     </div>''' for s in br.get("sabah_60_saniye",[])])
 
     so = br.get("samsun_odak",{})
     samsun_html = f'''<div style="background:#fef3c7;padding:16px;border-radius:8px;border-left:5px solid #f59e0b">
         <div style="font-weight:700;color:#78350f;margin-bottom:10px">🏪 Samsun & Bölge Odağı</div>
-        <div style="color:#334155;font-size:13px;margin-bottom:10px"><b>Gelişme:</b> {so.get("gelisme","")}</div>
-        <div style="background:white;padding:10px;border-radius:4px;font-size:13px;margin-bottom:8px"><b style="color:#92400e">BİM Samsun'a etkisi:</b> {so.get("bim_etkisi","")}</div>
-        <div style="background:#dcfce7;padding:10px;border-radius:4px;font-size:13px"><b style="color:#166534">Öneri:</b> {so.get("aksiyon","")}</div>
+        <div style="color:#334155;font-size:13px;margin-bottom:10px"><b>Gelişme:</b> {so.get("gelisme","") or "(haber yok)"}</div>
+        <div style="background:white;padding:10px;border-radius:4px;font-size:13px;margin-bottom:8px"><b style="color:#92400e">BİM Samsun'a etkisi:</b> {so.get("bim_etkisi","") or "-"}</div>
+        <div style="background:#dcfce7;padding:10px;border-radius:4px;font-size:13px"><b style="color:#166534">Öneri:</b> {so.get("aksiyon","") or "-"}</div>
     </div>'''
 
     kararlar = "".join([f'''<div style="padding:16px;margin:10px 0;background:#fffbeb;border-left:5px solid #f59e0b;border-radius:6px">
@@ -424,9 +427,9 @@ def html_uret(br, abd_df, tr_df, makro_df, haberler, terim, tema):
     senaryolar = "".join([f'''<div style="padding:16px;margin:12px 0;background:white;border:1px solid #e2e8f0;border-radius:8px">
         <div style="font-weight:700;color:#0f172a;margin-bottom:12px">🎯 {s.get("tetikleyici","")}</div>
         <table style="width:100%;font-size:13px;border-collapse:collapse">
-            <tr><td style="color:#047857;padding:6px 10px 6px 0;width:110px;vertical-align:top"><b>✅ İyimser</b></td><td style="color:#334155;padding:6px 0">{s.get("iyimser","")}</td></tr>
-            <tr><td style="color:#1d4ed8;padding:6px 10px 6px 0;vertical-align:top"><b>⚖️ Baz</b></td><td style="color:#334155;padding:6px 0">{s.get("baz","")}</td></tr>
-            <tr><td style="color:#b91c1c;padding:6px 10px 6px 0;vertical-align:top"><b>⚠️ Kötümser</b></td><td style="color:#334155;padding:6px 0">{s.get("kotumser","")}</td></tr>
+            <tr><td style="color:#047857;padding:6px 10px 6px 0;width:110px"><b>✅ İyimser</b></td><td style="color:#334155">{s.get("iyimser","")}</td></tr>
+            <tr><td style="color:#1d4ed8;padding:6px 10px 6px 0"><b>⚖️ Baz</b></td><td style="color:#334155">{s.get("baz","")}</td></tr>
+            <tr><td style="color:#b91c1c;padding:6px 10px 6px 0"><b>⚠️ Kötümser</b></td><td style="color:#334155">{s.get("kotumser","")}</td></tr>
         </table>
         <div style="background:#eff6ff;padding:10px;border-radius:4px;margin-top:10px;font-size:12px;color:#1e40af"><b>🛡️ Hazırlık:</b> {s.get("hazırlık","")}</div>
     </div>''' for s in br.get("senaryolar",[])])
@@ -434,8 +437,8 @@ def html_uret(br, abd_df, tr_df, makro_df, haberler, terim, tema):
     sh = br.get("saha_nabzi",{})
     saha_html = f'''<div style="background:#fef3c7;padding:16px;border-radius:8px;border-left:5px solid #f59e0b">
         <div style="font-weight:700;color:#78350f;margin-bottom:8px">🔍 Bugün Mağazada</div>
-        <div style="color:#334155;font-size:13px;margin-bottom:10px">{sh.get("gozlem","")}</div>
-        <div style="background:white;padding:10px;border-radius:4px;font-size:13px"><b style="color:#92400e">Müdüre soru:</b> {sh.get("soru","")}<br><span style="color:#64748b;font-size:12px;font-style:italic">{sh.get("beklenti","")}</span></div>
+        <div style="color:#334155;font-size:13px;margin-bottom:10px">{sh.get("gozlem","") or "-"}</div>
+        <div style="background:white;padding:10px;border-radius:4px;font-size:13px"><b style="color:#92400e">Müdüre soru:</b> {sh.get("soru","") or "-"}<br><span style="color:#64748b;font-size:12px;font-style:italic">{sh.get("beklenti","")}</span></div>
     </div>'''
 
     atlas_html = '<table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:10px"><thead><tr style="background:#1e293b;color:white">'
@@ -450,7 +453,9 @@ def html_uret(br, abd_df, tr_df, makro_df, haberler, terim, tema):
 
     haber_html = ""
     for kategori, kayitlar in haberler.items():
-        if not kayitlar: continue
+        if not kayitlar:
+            haber_html += f'<div style="margin-top:14px"><div style="font-weight:700;color:#1e40af;font-size:13px">{kategori}</div><div style="color:#94a3b8;font-size:12px;padding:8px">(Bu kategoride haber bulunamadı)</div></div>'
+            continue
         haber_html += f'<div style="margin-top:14px"><div style="font-weight:700;color:#1e40af;font-size:13px;margin-bottom:6px">{kategori}</div>'
         for h in kayitlar[:3]:
             link = h.get("Link","")
@@ -464,25 +469,23 @@ def html_uret(br, abd_df, tr_df, makro_df, haberler, terim, tema):
         <h1 style="margin:8px 0 0 0;font-size:26px;font-weight:700">{tarih}</h1>
         <div style="margin-top:16px;padding:12px 16px;background:rgba(255,255,255,0.1);border-radius:8px;border-left:4px solid #fbbf24"><div style="font-size:11px;opacity:0.8;letter-spacing:1px">BUGÜNÜN MANŞETİ</div><div style="font-size:15px;font-weight:600;margin-top:4px">{br.get("manset","")}</div></div>
     </div>
+    {hata_html}
     <div style="background:{bg};border:2px solid {renk};padding:14px;border-radius:10px;margin-top:14px;text-align:center"><span style="font-size:11px;color:{renk};letter-spacing:2px;font-weight:700">DURUM</span><div style="font-size:15px;font-weight:700;color:{renk};margin-top:4px">{br.get("uyari_seviyesi","")}</div></div>
-    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">🧭 Haftalık Pusula</h3><div style="font-size:11px;color:#64748b;letter-spacing:1px">{tema[0]}</div><div style="color:#334155;font-size:14px;margin-top:8px;line-height:1.7">{br.get("haftalik_pusula","")}</div></div>
-    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">⏱️ Sabah 60 Saniye</h3>{sinyaller}</div>
+    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">🧭 Haftalık Pusula</h3><div style="font-size:11px;color:#64748b">{tema[0]}</div><div style="color:#334155;font-size:14px;margin-top:8px">{br.get("haftalik_pusula","") or "(AI özet üretemedi)"}</div></div>
+    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">⏱️ Sabah 60 Saniye</h3>{sinyaller or "<em>AI sinyal üretemedi.</em>"}</div>
     <div style="background:white;padding:20px;margin-top:14px;border-radius:12px">{samsun_html}</div>
-    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">⚖️ Bugünün Karar Gündemi</h3>{kararlar}</div>
-    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">🎯 Rakip Radarı</h3>{rakipler}</div>
-    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">📡 Makro Pusu</h3>{makrolar}</div>
-    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">🎲 Senaryo Laboratuvarı</h3>{senaryolar}</div>
+    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">⚖️ Bugünün Karar Gündemi</h3>{kararlar or "<em>AI karar üretemedi.</em>"}</div>
+    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">🎯 Rakip Radarı</h3>{rakipler or "<em>AI rakip üretemedi.</em>"}</div>
+    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">📡 Makro Pusu</h3>{makrolar or "<em>AI makro üretemedi.</em>"}</div>
+    <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">🎲 Senaryo Laboratuvarı</h3>{senaryolar or "<em>AI senaryo üretemedi.</em>"}</div>
     <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">🏪 Saha Nabzı</h3>{saha_html}</div>
     <div style="background:linear-gradient(135deg,#1e293b 0%,#334155 100%);color:white;padding:20px;margin-top:14px;border-radius:12px"><div style="font-size:11px;opacity:0.7;letter-spacing:2px">GÜNÜN TERİMİ</div><div style="font-size:20px;font-weight:700;margin:6px 0">{terim[0]}</div><div style="font-size:14px;opacity:0.9;line-height:1.6">{terim[1]}</div><div style="background:rgba(59,130,246,0.2);padding:12px;border-radius:6px;margin-top:12px;border-left:3px solid #60a5fa;font-size:13px"><b>💡 BİM için anlamı:</b> {terim[2]}</div></div>
     <div style="background:white;padding:20px;margin-top:14px;border-radius:12px">{df_table(tr_df, "🇹🇷 Türkiye Perakendecileri")}{df_table(abd_df, "🌍 ABD Devleri (SEC)")}{df_table(makro_df, "📈 Makro (Dünya Bankası)")}</div>
     <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">🌐 Dünya Perakendecileri Atlası</h3>{atlas_html}</div>
     <div style="background:white;padding:20px;margin-top:14px;border-radius:12px"><h3 style="color:#0f172a;border-bottom:2px solid #3b82f6;padding-bottom:6px;margin-top:0">📰 Günün Haberleri</h3>{haber_html}</div>
-    <div style="background:#0f172a;color:#94a3b8;padding:20px;margin-top:14px;border-radius:12px;font-size:11px;text-align:center;line-height:1.7"><b style="color:#e2e8f0">BİM SAMSUN CEO BRİFİNG</b> · Otomatik<br>Kaynaklar: SEC · Dünya Bankası · AA · Bloomberg HT · BBC · Google News · Groq AI<br>📎 Excel eki: detaylı veriler<br><span style="color:#64748b;font-size:10px">Yapay zekâ destekli analizdir. Kritik kararlar öncesi TÜİK, TCMB, KAP doğrulayın.</span></div>
+    <div style="background:#0f172a;color:#94a3b8;padding:20px;margin-top:14px;border-radius:12px;font-size:11px;text-align:center;line-height:1.7"><b style="color:#e2e8f0">BİM SAMSUN CEO BRİFİNG</b><br>Kaynaklar: SEC · Dünya Bankası · AA · Bloomberg HT · BBC · Google News · Groq<br>📎 Excel eki<br><span style="color:#64748b;font-size:10px">Kritik kararlar öncesi TÜİK, TCMB, KAP doğrulayın.</span></div>
     </body></html>'''
 
-# ============================================================
-# EXCEL + MAIL
-# ============================================================
 def excel(abd_df, tr_df, makro_df, haberler, br):
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -492,7 +495,7 @@ def excel(abd_df, tr_df, makro_df, haberler, br):
         pd.DataFrame(DUNYA_ATLASI).to_excel(w, sheet_name="Dunya Atlasi", index=False)
         if br.get("sabah_60_saniye"): pd.DataFrame(br["sabah_60_saniye"]).to_excel(w, sheet_name="60 Saniye", index=False)
         if br.get("karar_gundemi"): pd.DataFrame(br["karar_gundemi"]).to_excel(w, sheet_name="Karar Gundemi", index=False)
-        if br.get("rakip_radari"): pd.DataFrame(br["rakip_radari"]).to_excel(w, sheet_name="Rakip Radari", index=False)
+        if HATALAR: pd.DataFrame({"Hata": HATALAR}).to_excel(w, sheet_name="Sistem Uyarilari", index=False)
         tum = []
         for k, v in haberler.items():
             for h in v: tum.append({**h, "Kategori": k})
@@ -513,18 +516,25 @@ def mail(html, excel_data):
         s.sendmail(MAIL_USER, MAIL_TO, msg.as_string())
     print("✅ Mail gönderildi.")
 
-# ============================================================
-# MAIN
-# ============================================================
 def main():
     print("=" * 60); print(f"BİM SAMSUN BRİFİNG — {datetime.now()}"); print("=" * 60)
-    client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+    if not GROQ_API_KEY:
+        hata_yaz("GROQ_API_KEY ortam değişkeni BOŞ!")
+
+    client = None
+    try:
+        if GROQ_API_KEY:
+            client = Groq(api_key=GROQ_API_KEY)
+            print("✓ Groq client oluşturuldu")
+    except Exception as e:
+        hata_yaz(f"Groq client hatası: {e}")
+
     tema = HAFTANIN_TEMASI.get(datetime.now().weekday(), HAFTANIN_TEMASI[0])
     terim = gunun_terimi()
 
     print("[1/6] Haberler...")
     haberler = haber_topla()
-    for k, v in haberler.items(): print(f"    {k}: {len(v)} haber")
 
     print("[2/6] Çeviri...")
     haberler = cevir(haberler, client)
@@ -541,12 +551,13 @@ def main():
     print("[6/6] AI brifing (3 çağrı)...")
     br = ceo_brifing(abd_df, tr_df, makro_df, haberler, terim, tema, client)
 
+    print(f"⚠️ Toplam {len(HATALAR)} hata/uyarı")
     print("📧 HTML + Excel...")
     html = html_uret(br, abd_df, tr_df, makro_df, haberler, terim, tema)
     try:
         ex = excel(abd_df, tr_df, makro_df, haberler, br)
     except Exception as e:
-        print(f"Excel hatası: {e}"); ex = None
+        hata_yaz(f"Excel hatası: {e}"); ex = None
 
     print("📤 Mail...")
     mail(html, ex)
