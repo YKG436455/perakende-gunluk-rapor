@@ -435,15 +435,21 @@ def df_table(df, baslik):
     return h + '</tbody></table>'
 
 def kart_listesi(items, icon, anahtar_baslik, alt_alanlar, renk="#3b82f6"):
-    """Genel kart listesi üretici."""
-    if not items: return "<em>Veri yok.</em>"
+    """Genel kart listesi üretici. String/dict esnek."""
+    if not items or not isinstance(items, list):
+        return "<em>Veri yok.</em>"
     html = ""
     for it in items:
+        # String geldiyse dict'e çevir
+        if isinstance(it, str):
+            it = {anahtar_baslik: it}
+        if not isinstance(it, dict):
+            continue
         html += f'''<div style="padding:12px;margin:8px 0;background:#f8fafc;border-left:4px solid {renk};border-radius:6px">
             <div style="font-weight:700;color:#0f172a">{icon} {it.get(anahtar_baslik,"")}</div>'''
         for alan, baslik, style in alt_alanlar:
             val = it.get(alan, "")
-            if val:
+            if val and not isinstance(val, (dict, list)):
                 html += f'<div style="color:#334155;font-size:13px;margin-top:6px;{style}"><b>{baslik}:</b> {val}</div>'
         html += '</div>'
     return html
